@@ -13,15 +13,27 @@ class FakeVaultApi implements VaultApi {
   ciphertext: string | null = null
   nonce: string | null = null
   putCalls: Array<{ expectedVersion: number; ciphertext: string; nonce: string }> = []
+  getCalls = 0
   failNextPut: Error | null = null
   failNextGet: Error | null = null
+  nextGet: { version: number; ciphertext: string; nonce: string } | null = null
   putDelayMs = 0
+  getDelayMs = 0
 
   async getVault() {
+    this.getCalls += 1
+    if (this.getDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.getDelayMs))
+    }
     if (this.failNextGet) {
       const error = this.failNextGet
       this.failNextGet = null
       throw error
+    }
+    if (this.nextGet) {
+      const response = this.nextGet
+      this.nextGet = null
+      return response
     }
     return { version: this.version, ciphertext: this.ciphertext, nonce: this.nonce }
   }
@@ -103,13 +115,61 @@ describe('VaultSyncController', () => {
     await vi.waitFor(assertion, { timeout, interval: 5 })
   }
 
-  it('loads an empty vault', async () => {
+  it('loads an empty vault and marks it initialized', async () => {
     const api = new FakeVaultApi()
     const socket = new FakeSocket()
     const controller = makeController(api, socket)
 
     await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
     expect(controller.snapshot().draft).toEqual(createEmptyVault())
+    expect(controller.snapshot().serverVersion).toBe(0)
+    expect(controller.snapshot().initialized).toBe(true)
+    expect(controller.snapshot().revision).toBe(1)
+    controller.dispose()
+  })
+
+  it('does not let socket open before the initial fetch wedge an empty vault', async () => {
+    const api = new FakeVaultApi()
+    api.getDelayMs = 10
+    const socket = new FakeSocket()
+    const controller = makeController(api, socket)
+
+    socket.emitOpen()
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+    expect(controller.snapshot().initialized).toBe(true)
+    expect(controller.snapshot().serverVersion).toBe(0)
+    controller.dispose()
+  })
+
+  it('blocks edits until the first verified load and then installs remote content', async () => {
+    const api = new FakeVaultApi()
+    api.getDelayMs = 15
+    await api.setRemoteVault(remoteDoc, 4, keys.encryptionKey)
+    const socket = new FakeSocket()
+    const controller = makeController(api, socket)
+
+    controller.mutate((draft) => addNote(draft, 'blocked-note', 1))
+    expect(controller.snapshot().initialized).toBe(false)
+    expect(controller.snapshot().draft).toEqual(createEmptyVault())
+
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+    expect(controller.snapshot().draft).toEqual(remoteDoc)
+    expect(controller.snapshot().serverVersion).toBe(4)
+    expect(controller.snapshot().dirty).toBe(false)
+    controller.dispose()
+  })
+
+  it('retries a failed initial load', async () => {
+    const api = new FakeVaultApi()
+    api.failNextGet = new ApiError(0, 'Network request failed')
+    const socket = new FakeSocket()
+    const controller = makeController(api, socket)
+
+    await waitFor(() => expect(controller.snapshot().status).toBe('offline'))
+    expect(controller.snapshot().initialized).toBe(false)
+
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+    expect(controller.snapshot().initialized).toBe(true)
     expect(controller.snapshot().serverVersion).toBe(0)
     controller.dispose()
   })
@@ -166,8 +226,9 @@ describe('VaultSyncController', () => {
     await api.setRemoteVault(remoteDoc, 5, keys.encryptionKey)
     controller.setDraft(localDoc)
 
-    await waitFor(() => expect(controller.snapshot().status).toBe('conflict'))
+    await waitFor(() => expect(controller.snapshot().conflict?.remoteDoc).toEqual(remoteDoc))
     const conflict = controller.snapshot().conflict
+    expect(controller.snapshot().status).toBe('conflict')
     expect(conflict?.remoteVersion).toBe(5)
     expect(conflict?.remoteDoc).toEqual(remoteDoc)
     expect(conflict?.localDoc).toEqual(localDoc)
@@ -183,7 +244,7 @@ describe('VaultSyncController', () => {
 
     await api.setRemoteVault(remoteDoc, 5, keys.encryptionKey)
     controller.setDraft(localDoc)
-    await waitFor(() => expect(controller.snapshot().status).toBe('conflict'))
+    await waitFor(() => expect(controller.snapshot().conflict?.remoteDoc).toEqual(remoteDoc))
 
     controller.resolveConflict('keep-local')
     await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
@@ -195,6 +256,24 @@ describe('VaultSyncController', () => {
       keys.encryptionKey,
     )
     expect(decrypted).toEqual(localDoc)
+    controller.dispose()
+  })
+
+  it('load-remote bumps the editor revision', async () => {
+    const api = new FakeVaultApi()
+    const socket = new FakeSocket()
+    const controller = makeController(api, socket)
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+    const initialRevision = controller.snapshot().revision
+
+    await api.setRemoteVault(remoteDoc, 5, keys.encryptionKey)
+    controller.setDraft(localDoc)
+    await waitFor(() => expect(controller.snapshot().conflict?.remoteDoc).toEqual(remoteDoc))
+
+    controller.resolveConflict('load-remote')
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+    expect(controller.snapshot().draft).toEqual(remoteDoc)
+    expect(controller.snapshot().revision).toBe(initialRevision + 1)
     controller.dispose()
   })
 
@@ -243,23 +322,23 @@ describe('VaultSyncController', () => {
     controller.dispose()
   })
 
-  it('notifies auth error on a 401 save', async () => {
+  it('freezes a dirty draft when a save returns 401', async () => {
     const api = new FakeVaultApi()
+    api.putDelayMs = 20
     const socket = new FakeSocket()
-    const onAuthError = vi.fn()
-    const controller = new VaultSyncController(keys, {
-      vaultApi: api,
-      createSocket: () => socket,
-      debounceMs: 5,
-      onAuthError,
-    })
-    controller.start()
+    const controller = makeController(api, socket)
     await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
 
-    api.failNextPut = new ApiError(401, 'Unauthorized')
     controller.setDraft(localDoc)
+    await waitFor(() => expect(controller.snapshot().status).toBe('saving'))
+    api.failNextPut = new ApiError(401, 'Unauthorized')
 
-    await waitFor(() => expect(onAuthError).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(controller.snapshot().sessionExpired).toBe(true))
+    expect(controller.snapshot().draft).toEqual(localDoc)
+    expect(controller.snapshot().dirty).toBe(true)
+
+    controller.mutate((draft) => addNote(draft, 'must-not-write', 2))
+    expect(controller.snapshot().draft).toEqual(localDoc)
     controller.dispose()
   })
 
@@ -283,20 +362,69 @@ describe('VaultSyncController', () => {
     controller.dispose()
   })
 
-  it('can restart after dispose for StrictMode remounts', async () => {
+  it('reconciles a pending higher remote version after a successful save', async () => {
     const api = new FakeVaultApi()
+    api.putDelayMs = 20
+    const socket = new FakeSocket()
+    const controller = makeController(api, socket)
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+
+    const encryptedRemote = await encryptVault(remoteDoc, keys.encryptionKey)
+    controller.setDraft(localDoc)
+    await waitFor(() => expect(controller.snapshot().status).toBe('saving'))
+
+    api.nextGet = { version: 2, ...encryptedRemote }
+    socket.emitMessage({ type: 'vault_changed', version: 2 })
+
+    await waitFor(() => expect(controller.snapshot().serverVersion).toBe(2))
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+    expect(controller.snapshot().draft).toEqual(remoteDoc)
+    expect(controller.snapshot().conflict).toBeNull()
+    controller.dispose()
+  })
+
+  it('raises a conflict when a pending remote watermark arrives with local edits', async () => {
+    const api = new FakeVaultApi()
+    api.putDelayMs = 20
+    const socket = new FakeSocket()
+    const controller = makeController(api, socket)
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+
+    const encryptedRemote = await encryptVault(remoteDoc, keys.encryptionKey)
+    controller.setDraft(localDoc)
+    await waitFor(() => expect(controller.snapshot().status).toBe('saving'))
+
+    const newerDoc = addNote(localDoc, 'second-note', 2)
+    controller.setDraft(newerDoc)
+    api.nextGet = { version: 2, ...encryptedRemote }
+    socket.emitMessage({ type: 'vault_changed', version: 2 })
+
+    await waitFor(() => expect(controller.snapshot().status).toBe('conflict'))
+    expect(controller.snapshot().conflict?.localDoc).toEqual(newerDoc)
+    expect(controller.snapshot().conflict?.remoteDoc).toEqual(remoteDoc)
+    controller.dispose()
+  })
+
+  it('ignores a stale in-flight save across dispose/restart', async () => {
+    const api = new FakeVaultApi()
+    api.putDelayMs = 60
     const socket = new FakeSocket()
     const controller = makeController(api, socket)
     await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
 
     controller.setDraft(localDoc)
-    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+    await waitFor(() => expect(controller.snapshot().status).toBe('saving'))
 
     controller.dispose()
     controller.start()
     await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
-    expect(controller.snapshot().draft).toEqual(localDoc)
-    expect(controller.snapshot().serverVersion).toBe(1)
+    expect(controller.snapshot().serverVersion).toBe(0)
+    expect(controller.snapshot().draft).toEqual(createEmptyVault())
+
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(controller.snapshot().serverVersion).toBe(0)
+    expect(controller.snapshot().draft).toEqual(createEmptyVault())
+    expect(api.version).toBe(1)
     controller.dispose()
   })
 })

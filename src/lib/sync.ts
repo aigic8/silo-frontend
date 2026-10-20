@@ -26,6 +26,12 @@ export interface VaultSyncSnapshot {
   dirty: boolean
   conflict: ConflictState | null
   errorMessage: string | null
+  /** True only after the first vault fetch has decrypted and installed safely. */
+  initialized: boolean
+  /** Bumped only when server state is installed; drives editor remounts. */
+  revision: number
+  /** True when the session was revoked/expired and the local draft is frozen. */
+  sessionExpired: boolean
 }
 
 export interface VaultSyncOptions {
@@ -34,7 +40,6 @@ export interface VaultSyncOptions {
   debounceMs?: number
   retryBaseMs?: number
   retryMaxMs?: number
-  onAuthError?: () => void
   onFatal?: (error: Error) => void
 }
 
@@ -58,17 +63,27 @@ export class VaultSyncController {
   private connectedFlag = false
   private conflictState: ConflictState | null = null
   private errorMessage: string | null = null
+  private initializedFlag = false
+  private revision = 0
+  private sessionExpiredFlag = false
 
   private readonly listeners = new Set<() => void>()
   private inflight = false
   private queued = false
-  private generation = 0
+  /** Lifecycle generation: only work started in the current lifecycle may mutate state. */
+  private lifecycle = 0
+  /** Fetch generation: only the latest remote GET may install remote state. */
+  private fetchGeneration = 0
   private retryAttempt = 0
   private disposed = false
+  private initialLoadInFlight = false
+  private pendingRemoteVersion = 0
+  private postSaveReconcile = false
   private socket: WebSocketLike | null = null
   private debounceTimer: ReturnType<typeof setTimeout> | null = null
   private retryTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private initialRetryTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(
     private readonly keys: DerivedKeys,
@@ -84,6 +99,9 @@ export class VaultSyncController {
       dirty: this.dirtyFlag,
       conflict: this.conflictState,
       errorMessage: this.errorMessage,
+      initialized: this.initializedFlag,
+      revision: this.revision,
+      sessionExpired: this.sessionExpiredFlag,
     }
   }
 
@@ -101,7 +119,8 @@ export class VaultSyncController {
     this.socket = null
     this.clearTimers()
     this.disposed = false
-    this.generation += 1
+    this.lifecycle += 1
+    this.fetchGeneration += 1
     this.draftDoc = createEmptyVault()
     this.dirtyFlag = false
     this.serverVersion = 0
@@ -109,8 +128,14 @@ export class VaultSyncController {
     this.connectedFlag = false
     this.conflictState = null
     this.errorMessage = null
+    this.initializedFlag = false
+    this.revision = 0
+    this.sessionExpiredFlag = false
     this.inflight = false
     this.queued = false
+    this.initialLoadInFlight = false
+    this.pendingRemoteVersion = 0
+    this.postSaveReconcile = false
     this.retryAttempt = 0
     this.emit()
     void this.loadInitial()
@@ -119,6 +144,8 @@ export class VaultSyncController {
 
   dispose(): void {
     this.disposed = true
+    this.lifecycle += 1
+    this.fetchGeneration += 1
     this.clearTimers()
     this.socket?.close()
     this.socket = null
@@ -130,39 +157,56 @@ export class VaultSyncController {
   }
 
   mutate = (mutator: (draft: VaultDocument) => VaultDocument): void => {
-    if (this.disposed) return
-    this.draftDoc = mutator(this.draftDoc)
-    if (this.conflictState) {
-      // Autosave is paused while the user has a conflict to resolve.
-      this.emit()
+    if (
+      this.disposed ||
+      !this.initializedFlag ||
+      this.sessionExpiredFlag ||
+      this.conflictState
+    ) {
       return
     }
+    this.draftDoc = mutator(this.draftDoc)
     this.errorMessage = null
     this.dirtyFlag = true
     this.setStatus('dirty')
     this.scheduleSave()
   }
 
-  retryNow = (): void => {
+  exportDraft = (): void => {
     if (this.disposed) return
+    this.exportLocalDraft(this.draftDoc)
+  }
+
+  retryNow = (): void => {
+    if (this.disposed || this.sessionExpiredFlag) return
     this.clearRetryTimer()
     this.clearDebounceTimer()
+    this.clearInitialRetryTimer()
     this.errorMessage = null
+
+    if (!this.initializedFlag) {
+      this.setStatus('loading')
+      void this.loadInitial()
+      return
+    }
+
     if (this.conflictState) {
       void this.fetchRemoteForConflict(this.conflictState.remoteVersion ?? undefined)
       return
     }
+
     if (this.dirtyFlag) {
       this.setStatus('dirty')
       this.enqueueSave()
       return
     }
+
     void this.applyRemote()
   }
 
   resolveConflict = (action: ResolveAction): void => {
     const conflict = this.conflictState
-    if (!conflict || this.disposed) return
+    if (!conflict || this.disposed || this.sessionExpiredFlag) return
 
     if (action === 'export-local') {
       this.exportLocalDraft(conflict.localDoc)
@@ -179,7 +223,9 @@ export class VaultSyncController {
       this.dirtyFlag = false
       this.conflictState = null
       this.errorMessage = null
+      this.pendingRemoteVersion = 0
       this.queued = false
+      this.revision += 1
       this.setStatus('saved')
       return
     }
@@ -192,6 +238,7 @@ export class VaultSyncController {
       this.serverVersion = conflict.remoteVersion
       this.conflictState = null
       this.errorMessage = null
+      this.pendingRemoteVersion = 0
       this.dirtyFlag = true
       this.queued = false
       this.setStatus('dirty')
@@ -210,28 +257,38 @@ export class VaultSyncController {
   }
 
   private async loadInitial(): Promise<void> {
-    const generation = ++this.generation
+    if (this.disposed || this.sessionExpiredFlag || this.initialLoadInFlight) return
+    this.initialLoadInFlight = true
+    const lifecycle = this.lifecycle
     try {
       const response = await this.options.vaultApi.getVault()
-      if (!this.isCurrent(generation)) return
+      if (!this.isCurrentLifecycle(lifecycle)) return
       const doc = await this.decryptResponse(response)
-      if (!this.isCurrent(generation)) return
+      if (!this.isCurrentLifecycle(lifecycle)) return
+      if (this.initializedFlag || this.sessionExpiredFlag) return
       this.draftDoc = doc
       this.serverVersion = response.version
       this.dirtyFlag = false
+      this.initializedFlag = true
+      this.revision += 1
       this.setStatus('saved')
     } catch (error) {
-      if (!this.isCurrent(generation)) return
+      if (!this.isCurrentLifecycle(lifecycle)) return
       if (error instanceof ApiError) {
         if (error.status === 401) {
-          this.options.onAuthError?.()
+          this.enterSessionExpired()
           return
         }
         this.setStatus('offline')
+        this.scheduleInitialLoadRetry()
         return
       }
       this.setStatus('error')
       this.options.onFatal?.(toError(error))
+    } finally {
+      if (this.isCurrentLifecycle(lifecycle)) {
+        this.initialLoadInFlight = false
+      }
     }
   }
 
@@ -247,15 +304,21 @@ export class VaultSyncController {
   }
 
   private async applyRemote(): Promise<void> {
-    // Let an in-flight save settle first; its CAS response is the source of
-    // truth for whether the remote version changed.
-    if (this.inflight && this.dirtyFlag) return
-    const generation = ++this.generation
+    if (
+      this.disposed ||
+      this.sessionExpiredFlag ||
+      !this.initializedFlag ||
+      (this.inflight && this.dirtyFlag)
+    ) {
+      return
+    }
+    const fetchGeneration = ++this.fetchGeneration
+    const lifecycle = this.lifecycle
     try {
       const response = await this.options.vaultApi.getVault()
-      if (!this.isCurrent(generation)) return
+      if (!this.isCurrentFetch(fetchGeneration) || !this.isCurrentLifecycle(lifecycle)) return
       const doc = await this.decryptResponse(response)
-      if (!this.isCurrent(generation)) return
+      if (!this.isCurrentFetch(fetchGeneration) || !this.isCurrentLifecycle(lifecycle)) return
       if (response.version <= this.serverVersion) return
       if (this.dirtyFlag || this.conflictState) {
         await this.enterConflict(response.version, doc)
@@ -264,12 +327,13 @@ export class VaultSyncController {
       this.draftDoc = doc
       this.serverVersion = response.version
       this.dirtyFlag = false
+      this.revision += 1
       this.setStatus('saved')
     } catch (error) {
-      if (!this.isCurrent(generation)) return
+      if (!this.isCurrentFetch(fetchGeneration) || !this.isCurrentLifecycle(lifecycle)) return
       if (error instanceof ApiError) {
         if (error.status === 401) {
-          this.options.onAuthError?.()
+          this.enterSessionExpired()
           return
         }
         this.setStatus('offline')
@@ -280,8 +344,44 @@ export class VaultSyncController {
     }
   }
 
+  private async reconcilePostSave(): Promise<boolean> {
+    if (this.disposed || this.sessionExpiredFlag || !this.initializedFlag) return false
+    const fetchGeneration = ++this.fetchGeneration
+    const lifecycle = this.lifecycle
+    try {
+      const response = await this.options.vaultApi.getVault()
+      if (!this.isCurrentFetch(fetchGeneration) || !this.isCurrentLifecycle(lifecycle)) return false
+      const doc = await this.decryptResponse(response)
+      if (!this.isCurrentFetch(fetchGeneration) || !this.isCurrentLifecycle(lifecycle)) return false
+      if (response.version <= this.serverVersion) return false
+      if (this.dirtyFlag) {
+        await this.enterConflict(response.version, doc)
+        return true
+      }
+      this.draftDoc = doc
+      this.serverVersion = response.version
+      this.dirtyFlag = false
+      this.revision += 1
+      this.setStatus('saved')
+      return true
+    } catch (error) {
+      if (!this.isCurrentFetch(fetchGeneration) || !this.isCurrentLifecycle(lifecycle)) return false
+      if (error instanceof ApiError) {
+        if (error.status === 401) {
+          this.enterSessionExpired()
+          return false
+        }
+        this.setStatus('offline')
+        return false
+      }
+      this.setStatus('error')
+      this.options.onFatal?.(toError(error))
+      return false
+    }
+  }
+
   private connectSocket(): void {
-    if (this.disposed) return
+    if (this.disposed || this.sessionExpiredFlag) return
     this.clearReconnectTimer()
 
     let socket: WebSocketLike
@@ -296,15 +396,21 @@ export class VaultSyncController {
     this.socket = socket
 
     socket.onopen = () => {
-      if (this.disposed || this.socket !== socket) return
+      if (this.disposed || this.socket !== socket || this.sessionExpiredFlag) return
       this.retryAttempt = 0
       this.setConnected(true)
-      // Reconnecting may have missed invalidation events, so fetch latest.
-      void this.applyRemote()
+      // Initial load owns the first fetch; reconnects refresh only after that.
+      if (this.initializedFlag) {
+        if (this.inflight && this.dirtyFlag) {
+          this.postSaveReconcile = true
+        } else {
+          void this.applyRemote()
+        }
+      }
     }
 
     socket.onmessage = (event) => {
-      if (this.disposed || this.socket !== socket) return
+      if (this.disposed || this.socket !== socket || this.sessionExpiredFlag) return
       this.handleMessage(event)
     }
 
@@ -316,7 +422,9 @@ export class VaultSyncController {
       if (this.disposed || this.socket !== socket) return
       this.socket = null
       this.setConnected(false)
-      this.scheduleReconnect()
+      if (!this.sessionExpiredFlag) {
+        this.scheduleReconnect()
+      }
     }
   }
 
@@ -334,12 +442,13 @@ export class VaultSyncController {
   }
 
   private async handleRemoteVersion(version: number): Promise<void> {
-    if (this.disposed || version <= this.serverVersion) return
-    // A save that is already in flight owns reconciliation for the version it
-    // is about to produce. This avoids treating our own save's websocket echo
-    // (or a competing save whose result arrives via our PUT response) as a
-    // separate conflict before the CAS response is known.
-    if (this.inflight && this.dirtyFlag) return
+    if (this.disposed || this.sessionExpiredFlag || version <= this.serverVersion) return
+    // While a save is in flight, remember the highest observed remote version
+    // instead of dropping it. The save result then reconciles that watermark.
+    if (this.inflight && this.dirtyFlag) {
+      this.pendingRemoteVersion = Math.max(this.pendingRemoteVersion, version)
+      return
+    }
     if (this.dirtyFlag || this.conflictState) {
       await this.fetchRemoteForConflict(version)
       return
@@ -348,13 +457,15 @@ export class VaultSyncController {
   }
 
   private async fetchRemoteForConflict(knownVersion?: number): Promise<void> {
-    const generation = ++this.generation
+    if (this.disposed || this.sessionExpiredFlag) return
+    const fetchGeneration = ++this.fetchGeneration
+    const lifecycle = this.lifecycle
     const localDoc = this.draftDoc
     try {
       const response = await this.options.vaultApi.getVault()
-      if (!this.isCurrent(generation)) return
+      if (!this.isCurrentFetch(fetchGeneration) || !this.isCurrentLifecycle(lifecycle)) return
       const doc = await this.decryptResponse(response)
-      if (!this.isCurrent(generation)) return
+      if (!this.isCurrentFetch(fetchGeneration) || !this.isCurrentLifecycle(lifecycle)) return
       this.conflictState = {
         remoteVersion: response.version,
         remoteDoc: doc,
@@ -362,9 +473,9 @@ export class VaultSyncController {
       }
       this.setStatus('conflict')
     } catch (error) {
-      if (!this.isCurrent(generation)) return
+      if (!this.isCurrentFetch(fetchGeneration) || !this.isCurrentLifecycle(lifecycle)) return
       if (error instanceof ApiError && error.status === 401) {
-        this.options.onAuthError?.()
+        this.enterSessionExpired()
         return
       }
       this.conflictState = {
@@ -386,7 +497,7 @@ export class VaultSyncController {
   }
 
   private scheduleSave(): void {
-    if (this.disposed) return
+    if (this.disposed || this.sessionExpiredFlag || !this.initializedFlag) return
     this.clearDebounceTimer()
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null
@@ -395,7 +506,15 @@ export class VaultSyncController {
   }
 
   private enqueueSave(): void {
-    if (this.disposed || this.conflictState || !this.dirtyFlag) return
+    if (
+      this.disposed ||
+      this.sessionExpiredFlag ||
+      !this.initializedFlag ||
+      this.conflictState ||
+      !this.dirtyFlag
+    ) {
+      return
+    }
     if (this.inflight) {
       this.queued = true
       return
@@ -404,10 +523,16 @@ export class VaultSyncController {
   }
 
   private async performSave(): Promise<void> {
-    if (this.inflight) return
+    if (this.inflight || !this.initializedFlag || this.sessionExpiredFlag) return
+    const lifecycle = this.lifecycle
     this.inflight = true
     try {
-      while (this.dirtyFlag && !this.conflictState && !this.disposed) {
+      while (
+        this.dirtyFlag &&
+        !this.conflictState &&
+        !this.sessionExpiredFlag &&
+        this.isCurrentLifecycle(lifecycle)
+      ) {
         this.setStatus('saving')
         const docToSave = this.draftDoc
         const expectedVersion = this.serverVersion
@@ -422,6 +547,7 @@ export class VaultSyncController {
         try {
           encrypted = await encryptVault(docToSave, this.keys.encryptionKey)
         } catch (error) {
+          if (!this.isCurrentLifecycle(lifecycle)) return
           this.errorMessage = 'Could not encrypt the vault. Your data was not sent.'
           this.setStatus('error')
           this.options.onFatal?.(toError(error))
@@ -434,7 +560,7 @@ export class VaultSyncController {
             encrypted.ciphertext,
             encrypted.nonce,
           )
-          if (this.disposed) return
+          if (!this.isCurrentLifecycle(lifecycle)) return
           this.serverVersion = response.version
           this.retryAttempt = 0
           this.errorMessage = null
@@ -444,14 +570,35 @@ export class VaultSyncController {
             this.queued = true
           }
           this.setStatus(this.dirtyFlag ? 'dirty' : 'saved')
+
+          if (this.pendingRemoteVersion > this.serverVersion) {
+            const pending = this.pendingRemoteVersion
+            this.pendingRemoteVersion = 0
+            this.postSaveReconcile = false
+            if (this.dirtyFlag) {
+              await this.fetchRemoteForConflict(pending)
+            } else {
+              await this.applyRemote()
+            }
+            // Reconciliation installs remote/conflict state and pauses the queue.
+            return
+          }
+
+          if (this.postSaveReconcile) {
+            this.postSaveReconcile = false
+            const remoteChanged = await this.reconcilePostSave()
+            if (remoteChanged || this.conflictState || this.sessionExpiredFlag) return
+            // No newer remote content; fall through and continue any queued
+            // local save below.
+          }
         } catch (error) {
-          if (this.disposed) return
+          if (!this.isCurrentLifecycle(lifecycle)) return
           if (error instanceof ApiError && error.status === 409) {
             await this.enterConflictFromSave()
             return
           }
           if (error instanceof ApiError && error.status === 401) {
-            this.options.onAuthError?.()
+            this.enterSessionExpired()
             return
           }
           if (error instanceof ApiError && error.status >= 500) {
@@ -469,11 +616,14 @@ export class VaultSyncController {
           return
         }
 
+        if (!this.isCurrentLifecycle(lifecycle)) return
         if (!this.queued) break
         this.queued = false
       }
     } finally {
-      this.inflight = false
+      if (this.isCurrentLifecycle(lifecycle)) {
+        this.inflight = false
+      }
     }
   }
 
@@ -483,12 +633,24 @@ export class VaultSyncController {
       remoteDoc: null,
       localDoc: this.draftDoc,
     }
+    this.pendingRemoteVersion = 0
     this.setStatus('conflict')
     await this.fetchRemoteForConflict(undefined)
   }
 
-  private scheduleRetry(): void {
+  private enterSessionExpired(): void {
     if (this.disposed) return
+    this.sessionExpiredFlag = true
+    this.clearTimers()
+    this.socket?.close()
+    this.socket = null
+    this.setConnected(false)
+    this.errorMessage = 'Session expired'
+    this.setStatus('error')
+  }
+
+  private scheduleRetry(): void {
+    if (this.disposed || this.sessionExpiredFlag) return
     this.clearRetryTimer()
     const base = this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS
     const max = this.options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS
@@ -500,8 +662,24 @@ export class VaultSyncController {
     }, delay)
   }
 
+  private scheduleInitialLoadRetry(): void {
+    if (this.disposed || this.sessionExpiredFlag) return
+    this.clearInitialRetryTimer()
+    const base = this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS
+    const max = this.options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS
+    const delay = Math.min(max, base * 2 ** this.retryAttempt)
+    this.retryAttempt += 1
+    this.initialRetryTimer = setTimeout(() => {
+      this.initialRetryTimer = null
+      if (!this.initializedFlag && !this.sessionExpiredFlag) {
+        this.setStatus('loading')
+        void this.loadInitial()
+      }
+    }, delay)
+  }
+
   private scheduleReconnect(): void {
-    if (this.disposed) return
+    if (this.disposed || this.sessionExpiredFlag) return
     this.clearReconnectTimer()
     const base = this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS
     const max = this.options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS
@@ -519,14 +697,19 @@ export class VaultSyncController {
     this.emit()
   }
 
-  private isCurrent(generation: number): boolean {
-    return !this.disposed && generation === this.generation
+  private isCurrentLifecycle(generation: number): boolean {
+    return !this.disposed && generation === this.lifecycle
+  }
+
+  private isCurrentFetch(generation: number): boolean {
+    return !this.disposed && generation === this.fetchGeneration
   }
 
   private clearTimers(): void {
     this.clearDebounceTimer()
     this.clearRetryTimer()
     this.clearReconnectTimer()
+    this.clearInitialRetryTimer()
   }
 
   private clearDebounceTimer(): void {
@@ -547,6 +730,13 @@ export class VaultSyncController {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
+    }
+  }
+
+  private clearInitialRetryTimer(): void {
+    if (this.initialRetryTimer !== null) {
+      clearTimeout(this.initialRetryTimer)
+      this.initialRetryTimer = null
     }
   }
 

@@ -58,8 +58,9 @@ npm run build
 - `src/VaultApp.tsx` — authenticated, ready-state application shell.
 
 Only theme and sidebar preference are persisted to `localStorage`. Keys, the
-passphrase, and decrypted vault bytes exist only in memory and are wiped when
-the authenticated component unmounts (logout or session expiry).
+passphrase, and decrypted vault bytes exist only in memory. Explicit logout
+wipes them; a revoked/expired session freezes editing and keeps the local draft
+in memory until the user exports it or deliberately discards it.
 
 ## Crypto contract
 
@@ -70,6 +71,9 @@ the authenticated component unmounts (logout or session expiry).
   `silo-encryption-v1` derives the 256-bit auth key and a non-extractable
   AES-GCM-256 key.
 - The raw passphrase and vault key are never sent to the server.
+- Unlock derives the candidate auth verifier and verifies it with
+  `POST /api/auth/login` before entering the editor, including for an empty
+  vault, so a wrong passphrase can never write under the wrong key.
 - Every encryption uses a fresh random 12-byte nonce and
   `additionalData = "silo-vault-v1"`. The entire vault document (titles,
   folders, and serialized Lexical editor state) is encrypted as one blob.
@@ -89,6 +93,14 @@ Silo syncs whole-vault snapshots using an integer CAS version:
 - Keep-local deliberately re-saves with the latest remote version.
 - Transient network failures are retried with exponential backoff. Reconnects
   fetch the latest vault before applying.
+- Editing is blocked until the first vault fetch has decrypted and installed
+  safely; a failed initial fetch retries rather than treating an unverified
+  empty vault as initialized.
+- Remote invalidations observed during an in-flight save are kept as a pending
+  watermark and reconciled after the save completes, so a competing higher
+  version is never silently dropped.
+- A revoked/expired session freezes saves and mutations and presents an export
+  or discard choice instead of silently unmounting and losing unsaved work.
 - Websocket messages are invalidation-only (`vault_changed` with a version);
   they never carry plaintext.
 
@@ -123,7 +135,10 @@ deliberate CAS only, after an explicit conflict decision.
 ## Tests
 
 Unit tests cover crypto roundtrips, random nonces, wrong-key/tamper failures,
-vault document validation, and sync conflict/retry/serialization behavior.
+vault document validation, unlock verifier failure, editor remote-revision
+rebinding, initial-load/socket races, save/remote watermark reconciliation,
+session-expiry draft preservation, logout failure surfacing, and sync
+conflict/retry/serialization behavior.
 
 ```sh
 npm run typecheck

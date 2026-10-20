@@ -85,21 +85,31 @@ export default function App() {
     async (passphrase: string): Promise<void> => {
       if (auth.phase !== 'locked') return
       const keys = await deriveKeys(passphrase, base64ToBytes(auth.user.salt))
+      try {
+        const verifiedUser = await api.login({
+          email: auth.user.email,
+          auth_key: keys.authKeyBase64,
+        })
+        if (
+          verifiedUser.id !== auth.user.id ||
+          verifiedUser.email !== auth.user.email ||
+          verifiedUser.salt !== auth.user.salt
+        ) {
+          throw new Error('Account identity changed. Sign in again.')
+        }
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401) {
+          throw new Error('Incorrect passphrase')
+        }
+        throw error
+      }
       setAuth({ phase: 'ready', user: auth.user, keys })
     },
     [auth],
   )
 
   const handleSignOut = useCallback(async (): Promise<void> => {
-    try {
-      await api.logout()
-    } catch {
-      // The local session is cleared regardless of server response.
-    }
-    setAuth({ phase: 'signedOut' })
-  }, [])
-
-  const handleAuthError = useCallback(() => {
+    await api.logout()
     setAuth({ phase: 'signedOut' })
   }, [])
 
@@ -173,7 +183,7 @@ export default function App() {
       theme={theme}
       onToggleTheme={toggleTheme}
       onSignOut={handleSignOut}
-      onAuthError={handleAuthError}
+      onDiscardSession={() => setAuth({ phase: 'signedOut' })}
       onFatal={handleFatal}
     />
   )

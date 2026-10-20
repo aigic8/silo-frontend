@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ConflictDialog } from './components/ConflictDialog'
 import { NoteEditor } from './components/NoteEditor'
 import { SaveStatus } from './components/SaveStatus'
+import { SessionExpiredDialog } from './components/SessionExpiredDialog'
 import { Sidebar } from './components/Sidebar'
 import { useSidebarPreference } from './hooks/useSidebarPreference'
 import { useVaultSync } from './hooks/useVaultSync'
@@ -25,7 +26,7 @@ interface VaultAppProps {
   theme: Theme
   onToggleTheme: () => void
   onSignOut: () => Promise<void>
-  onAuthError: () => void
+  onDiscardSession: () => void
   onFatal: (error: Error) => void
 }
 
@@ -35,30 +36,31 @@ export function VaultApp({
   theme,
   onToggleTheme,
   onSignOut,
-  onAuthError,
+  onDiscardSession,
   onFatal,
 }: VaultAppProps) {
   const { sidebarCollapsed, toggleSidebar } = useSidebarPreference()
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null)
   const [logoutConfirm, setLogoutConfirm] = useState(false)
   const [signOutBusy, setSignOutBusy] = useState(false)
+  const [logoutError, setLogoutError] = useState<string | null>(null)
   const flushRef = useRef<(() => void) | null>(null)
 
   const syncOptions = useMemo(
     () => ({
-      onAuthError,
       onFatal,
       debounceMs: 800,
       retryBaseMs: 2_000,
       retryMaxMs: 30_000,
     }),
-    [onAuthError, onFatal],
+    [onFatal],
   )
 
   const sync = useVaultSync(keys, syncOptions)
   const mutate = sync.mutate
   const draft = sync.draft
   const selectedNote = draft.notes.find((note) => note.id === selectedNoteId) ?? null
+  const canEdit = sync.initialized && !sync.sessionExpired
 
   useEffect(() => {
     if (draft.notes.length === 0) {
@@ -173,12 +175,52 @@ export function VaultApp({
 
   async function handleSignOut(): Promise<void> {
     setSignOutBusy(true)
+    setLogoutError(null)
     try {
       await onSignOut()
+    } catch (error) {
+      setLogoutError(
+        error instanceof Error ? error.message : 'Could not log out. Try again.',
+      )
     } finally {
       setSignOutBusy(false)
       setLogoutConfirm(false)
     }
+  }
+
+  if (sync.sessionExpired) {
+    return (
+      <SessionExpiredDialog
+        onExport={sync.exportDraft}
+        onDiscard={onDiscardSession}
+      />
+    )
+  }
+
+  if (!sync.initialized) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-slate-50 p-4 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+        <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 text-center shadow-sm dark:border-slate-800 dark:bg-slate-900">
+          <h1 className="mb-2 text-xl font-semibold">
+            {sync.status === 'offline' ? 'Loading vault failed' : 'Loading vault…'}
+          </h1>
+          <p className="mb-4 text-sm text-slate-500 dark:text-slate-400">
+            {sync.status === 'offline'
+              ? 'Could not reach the server. Your vault has not been loaded yet.'
+              : 'Decrypting and validating your vault before editing.'}
+          </p>
+          {sync.status === 'offline' || sync.status === 'error' ? (
+            <button
+              type="button"
+              onClick={sync.retryNow}
+              className="rounded-lg bg-indigo-600 px-4 py-2 font-medium text-white hover:bg-indigo-500"
+            >
+              Retry
+            </button>
+          ) : null}
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -190,7 +232,7 @@ export function VaultApp({
             value={selectedNote?.title ?? ''}
             onChange={(event) => handleTitleChange(event.target.value)}
             placeholder={selectedNote ? 'Untitled' : 'No note selected'}
-            disabled={!selectedNote}
+            disabled={!selectedNote || !canEdit}
             className="min-w-0 flex-1 rounded-md border border-transparent bg-transparent px-2 py-1 text-lg font-medium outline-none placeholder:text-slate-400 focus:border-indigo-300 focus:ring-2 focus:ring-indigo-200 disabled:opacity-50 dark:placeholder:text-slate-500 dark:focus:border-indigo-800 dark:focus:ring-indigo-900"
           />
           <SaveStatus
@@ -210,10 +252,16 @@ export function VaultApp({
           </button>
         </header>
 
+        {logoutError ? (
+          <div role="alert" className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+            {logoutError}
+          </div>
+        ) : null}
+
         <div className="min-h-0 flex-1 overflow-y-auto">
           {selectedNote ? (
             <NoteEditor
-              key={selectedNote.id}
+              key={`${selectedNote.id}:${sync.revision}`}
               initialEditorState={selectedNote.editorState}
               onChange={(serialized) => handleEditorChange(selectedNote.id, serialized)}
               onFlushReady={(flush) => {
@@ -278,6 +326,11 @@ export function VaultApp({
               You have unsaved changes. Logging out will discard them and wipe
               the encryption key from this device.
             </p>
+            {logoutError ? (
+              <p role="alert" className="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950 dark:text-red-300">
+                {logoutError}
+              </p>
+            ) : null}
             <div className="flex justify-end gap-2">
               <button
                 type="button"

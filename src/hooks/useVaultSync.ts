@@ -12,6 +12,7 @@ export interface VaultSyncActions {
   mutate: (mutator: (draft: VaultDocument) => VaultDocument) => void
   retryNow: () => void
   resolveConflict: (action: 'load-remote' | 'keep-local' | 'export-local') => void
+  exportDraft: () => void
 }
 
 export type VaultSync = VaultSyncSnapshot & VaultSyncActions
@@ -22,7 +23,6 @@ export interface UseVaultSyncOptions {
   debounceMs?: number
   retryBaseMs?: number
   retryMaxMs?: number
-  onAuthError?: () => void
   onFatal?: (error: Error) => void
 }
 
@@ -33,7 +33,6 @@ export function useVaultSync(keys: DerivedKeys, options: UseVaultSyncOptions = {
     debounceMs,
     retryBaseMs,
     retryMaxMs,
-    onAuthError,
     onFatal,
   } = options
 
@@ -45,7 +44,6 @@ export function useVaultSync(keys: DerivedKeys, options: UseVaultSyncOptions = {
         debounceMs,
         retryBaseMs,
         retryMaxMs,
-        onAuthError,
         onFatal,
       }),
     [
@@ -55,7 +53,6 @@ export function useVaultSync(keys: DerivedKeys, options: UseVaultSyncOptions = {
       debounceMs,
       retryBaseMs,
       retryMaxMs,
-      onAuthError,
       onFatal,
     ],
   )
@@ -78,6 +75,7 @@ export function useVaultSync(keys: DerivedKeys, options: UseVaultSyncOptions = {
       mutate: controller.mutate,
       retryNow: controller.retryNow,
       resolveConflict: controller.resolveConflict,
+      exportDraft: controller.exportDraft,
     }),
     [controller],
   )
