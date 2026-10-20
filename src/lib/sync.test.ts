@@ -405,11 +405,26 @@ describe('VaultSyncController', () => {
     controller.dispose()
   })
 
-  it('ignores a stale in-flight save across dispose/restart', async () => {
+  it('does not initiate a stale PUT when encryption finishes after dispose/restart', async () => {
     const api = new FakeVaultApi()
-    api.putDelayMs = 60
     const socket = new FakeSocket()
-    const controller = makeController(api, socket)
+    let releaseEncryption!: () => void
+    const encryptionGate = new Promise<void>((resolve) => {
+      releaseEncryption = resolve
+    })
+
+    const controller = new VaultSyncController(keys, {
+      vaultApi: api,
+      createSocket: () => socket,
+      debounceMs: 5,
+      retryBaseMs: 5,
+      retryMaxMs: 20,
+      encryptVault: async () => {
+        await encryptionGate
+        return { ciphertext: 'ignored', nonce: 'ignored' }
+      },
+    })
+    controller.start()
     await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
 
     controller.setDraft(localDoc)
@@ -418,9 +433,34 @@ describe('VaultSyncController', () => {
     controller.dispose()
     controller.start()
     await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+
+    releaseEncryption()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(api.putCalls).toHaveLength(0)
+    expect(api.version).toBe(0)
+    controller.dispose()
+  })
+
+  it('acknowledges that an already-sent PUT commits even though stale state is ignored', async () => {
+    const api = new FakeVaultApi()
+    api.putDelayMs = 60
+    const socket = new FakeSocket()
+    const controller = makeController(api, socket)
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
+
+    controller.setDraft(localDoc)
+    await waitFor(() => expect(api.putCalls).toHaveLength(1))
+
+    controller.dispose()
+    controller.start()
+    await waitFor(() => expect(controller.snapshot().status).toBe('saved'))
     expect(controller.snapshot().serverVersion).toBe(0)
     expect(controller.snapshot().draft).toEqual(createEmptyVault())
 
+    // The HTTP write was already sent before dispose; the client cannot
+    // retract it. Assert the server commit still happens but cannot mutate
+    // the restarted local lifecycle.
     await new Promise((resolve) => setTimeout(resolve, 80))
     expect(controller.snapshot().serverVersion).toBe(0)
     expect(controller.snapshot().draft).toEqual(createEmptyVault())

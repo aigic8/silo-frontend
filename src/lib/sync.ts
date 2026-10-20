@@ -1,5 +1,10 @@
 import { ApiError, type VaultApi, type WebSocketLike } from './api'
-import { decryptVault, encryptVault, type DerivedKeys } from './crypto'
+import {
+  decryptVault,
+  encryptVault,
+  type DerivedKeys,
+  type EncryptedVault,
+} from './crypto'
 import { createEmptyVault, type VaultDocument } from './vault'
 
 export type SyncStatus =
@@ -41,6 +46,8 @@ export interface VaultSyncOptions {
   retryBaseMs?: number
   retryMaxMs?: number
   onFatal?: (error: Error) => void
+  /** Test seam; defaults to the real AES-GCM vault encryption. */
+  encryptVault?: (vault: VaultDocument, key: CryptoKey) => Promise<EncryptedVault>
 }
 
 const DEFAULT_DEBOUNCE_MS = 800
@@ -545,7 +552,10 @@ export class VaultSyncController {
 
         let encrypted
         try {
-          encrypted = await encryptVault(docToSave, this.keys.encryptionKey)
+          encrypted = await (this.options.encryptVault ?? encryptVault)(
+            docToSave,
+            this.keys.encryptionKey,
+          )
         } catch (error) {
           if (!this.isCurrentLifecycle(lifecycle)) return
           this.errorMessage = 'Could not encrypt the vault. Your data was not sent.'
@@ -553,6 +563,10 @@ export class VaultSyncController {
           this.options.onFatal?.(toError(error))
           return
         }
+
+        // Encryption is the last async boundary before an HTTP write. A
+        // disposed/restarted lifecycle must never initiate a stale PUT.
+        if (!this.isCurrentLifecycle(lifecycle)) return
 
         try {
           const response = await this.options.vaultApi.putVault(
